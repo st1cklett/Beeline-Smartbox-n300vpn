@@ -1,0 +1,377 @@
+#!/usr/bin/lua
+
+local root = "/mnt/usb/n300vpn"
+local control = root .. "/bin/n300vpn-control.sh"
+local subscription_path = root .. "/private/subscription.url"
+
+local function read_file(path)
+    local file = io.open(path, "rb")
+    if not file then return "" end
+    local value = file:read("*a") or ""
+    file:close()
+    return value:gsub("%s+$", "")
+end
+
+local function html(text)
+    return tostring(text or ""):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;"):gsub("'", "&#39;")
+end
+
+local function json(text)
+    return '"' .. tostring(text or ""):gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\b", "\\b"):gsub("\f", "\\f"):gsub("\n", "\\n"):gsub("\r", "\\r"):gsub("\t", "\\t"):gsub("[%z\001-\031]", "") .. '"'
+end
+
+local function decode(text)
+    text = (text or ""):gsub("+", " ")
+    return text:gsub("%%(%x%x)", function(hex) return string.char(tonumber(hex, 16)) end)
+end
+
+local function parse_form(text)
+    local values = {}
+    for item in (text or ""):gmatch("[^&]+") do
+        local key, value = item:match("^([^=]+)=?(.*)$")
+        if key then values[decode(key)] = decode(value) end
+    end
+    return values
+end
+
+local function split_tsv(line)
+    local fields = {}
+    local start = 1
+    while true do
+        local position = line:find("\t", start, true)
+        if not position then
+            fields[#fields + 1] = line:sub(start)
+            break
+        end
+        fields[#fields + 1] = line:sub(start, position - 1)
+        start = position + 1
+    end
+    return fields
+end
+
+local function run(arguments)
+    local command = control
+    for _, value in ipairs(arguments) do command = command .. " '" .. value .. "'" end
+    command = command .. " 2>&1; result=$?; echo __N300VPN_EXIT__=$result"
+    local pipe = io.popen(command, "r")
+    if not pipe then return "Не удалось запустить команду", false end
+    local output = pipe:read("*a") or ""
+    pipe:close()
+    local exit_text = output:match("__N300VPN_EXIT__=(%d+)%s*$")
+    local ok = exit_text == "0"
+    output = output:gsub("%s*__N300VPN_EXIT__=%d+%s*$", "")
+    output = output:gsub("%s+$", "")
+    return output ~= "" and output or (ok and "Готово" or "Команда завершилась с ошибкой"), ok and true or false
+end
+
+local function read_values(path)
+    local values = {}
+    local file = io.open(path, "rb")
+    if not file then return values end
+    for line in file:lines() do
+        local key, value = line:gsub("\r$", ""):match("^([%w_]+)=(.*)$")
+        if key then values[key] = value end
+    end
+    file:close()
+    return values
+end
+
+local function save_subscription_url(value)
+    value = tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local prefix = "https://crunch-crunch.com/sub/"
+    if #value < #prefix + 16 or #value > 2048 or value:sub(1, #prefix) ~= prefix then
+        return false, "Эта ссылка не похожа на поддерживаемую подписку Crunch."
+    end
+    local token_part = value:sub(#prefix + 1)
+    if not token_part:match("^[%w%._~%-]+$") then
+        return false, "В ссылке подписки обнаружены недопустимые символы."
+    end
+    os.execute("mkdir -p /mnt/usb/n300vpn/private")
+    local temporary = subscription_path .. ".new"
+    local file = io.open(temporary, "wb")
+    if not file then return false, "Не удалось сохранить подписку на USB-накопитель." end
+    file:write(value, "\n")
+    file:close()
+    os.execute("chmod 600 /mnt/usb/n300vpn/private/subscription.url.new")
+    if not os.rename(temporary, subscription_path) then
+        os.remove(temporary)
+        return false, "Не удалось безопасно применить подписку."
+    end
+    os.remove(root .. "/private/crunch.url")
+    return true, "Подписка сохранена."
+end
+
+local function load_state()
+    local status_output = run({"status"})
+    local status = {}
+    for line in status_output:gmatch("[^\r\n]+") do
+        local key, value = line:match("^([%w_]+)=(.*)$")
+        if key then status[key] = value end
+    end
+    local stats = read_values(root .. "/state/import.stats")
+    local youtube = {}
+    local youtube_file = io.open(root .. "/state/youtube-results.tsv", "rb")
+    if youtube_file then
+        for line in youtube_file:lines() do
+            local fields = split_tsv(line:gsub("\r$", ""))
+            if #fields >= 4 then
+                youtube[fields[2]] = {score=fields[1], page=fields[3], media=fields[4], endpoint=fields[5] or ""}
+            end
+        end
+        youtube_file:close()
+    end
+    local youtube_best = read_file(root .. "/state/youtube-best.id")
+    local nodes = {}
+    local selected = io.open(root .. "/state/selected.tsv", "rb")
+    if selected then
+        for line in selected:lines() do
+            local fields = split_tsv(line:gsub("\r$", ""))
+            if #fields >= 8 then
+                local source = fields[9] or (fields[3]:match("^Crunch%-VPN%-") and "crunch" or "repository")
+                local check = youtube[fields[2]] or {}
+                nodes[#nodes + 1] = {latency=fields[1], id=fields[2], label=fields[3], protocol=fields[4], server=fields[5], port=fields[6], transport=fields[7], security=fields[8], source=source, youtube_score=check.score or "", youtube_page=check.page or "", youtube_media=check.media or "", youtube_best=fields[2] == youtube_best}
+            end
+        end
+        selected:close()
+    end
+    return status, stats, nodes
+end
+
+local method = os.getenv("REQUEST_METHOD") or "GET"
+local query = parse_form(os.getenv("QUERY_STRING") or "")
+local form = {}
+if method == "POST" then
+    local length = tonumber(os.getenv("CONTENT_LENGTH") or "0") or 0
+    if length > 0 and length <= 4096 then form = parse_form(io.read(length)) end
+end
+
+local token = read_file(root .. "/state/web.token")
+local message = ""
+local action_ok = true
+if method == "POST" then
+    if token == "" or form.token ~= token then
+        message = "Защитный токен неверен; обновите страницу."
+        action_ok = false
+    elseif form.action == "enable" and form.id and form.id:match("^vless%-%x%x%x%x%x%x%x%x$") then
+        message, action_ok = run({"enable", form.id})
+    elseif form.action == "confirm" then
+        message, action_ok = run({"confirm"})
+    elseif form.action == "disable" then
+        message, action_ok = run({"disable"})
+    elseif form.action == "probe" and form.id and form.id:match("^vless%-%x%x%x%x%x%x%x%x$") then
+        message, action_ok = run({"probe", form.id})
+    elseif form.action == "youtube" and form.id and form.id:match("^vless%-%x%x%x%x%x%x%x%x$") then
+        message, action_ok = run({"youtube", form.id})
+    elseif form.action == "rank-youtube" and (form.source == "crunch" or form.source == "repository") then
+        message, action_ok = run({"rank-youtube", form.source})
+    elseif form.action == "rank-youtube" then
+        message = "Выберите источник серверов для проверки YouTube."
+        action_ok = false
+    elseif form.action == "add-subscription" then
+        local saved, save_message = save_subscription_url(form.url)
+        if saved then
+            message, action_ok = run({"refresh"})
+        else
+            message, action_ok = save_message, false
+        end
+    elseif form.action == "delete-subscription" then
+        message, action_ok = run({"remove-subscription"})
+    elseif form.action == "set-paths" then
+        local requested = {}
+        for _, path in ipairs({"lan1", "lan2", "lan3", "lan4", "wifi"}) do
+            if form["path_" .. path] == "1" then requested[#requested + 1] = path end
+        end
+        message, action_ok = run({"set-paths", table.concat(requested, ",")})
+    elseif form.action == "refresh" then
+        message, action_ok = run({"refresh"})
+    else
+        message = "Неизвестное действие."
+        action_ok = false
+    end
+end
+
+if not action_ok then
+    if message:find("already running", 1, true) or message:find("still running", 1, true) then
+        message = "Проверка серверов уже идёт. Дождитесь её завершения — прогресс показан на странице."
+    elseif message:find("no reachable servers", 1, true) then
+        message = "Пока нет доступных серверов. Сначала обновите подписку."
+    elseif message:find("no_working_nodes", 1, true) then
+        message = "Среди проверенных серверов не найдено подходящего для YouTube."
+    elseif message:find("selected node failed", 1, true) then
+        message = "Сервер перестал отвечать. Выберите другой сервер и повторите подключение."
+    elseif message:find("handshake failed", 1, true) or message:find("response header read failed", 1, true) then
+        message = "Этот сервер доступен, но не смог открыть YouTube. Попробуйте другой или запустите автоматический выбор лучших серверов."
+    elseif message:find("disable VPN before removing subscription", 1, true) then
+        message = "Перед удалением подписки выключите VPN, чтобы текущие устройства не потеряли соединение."
+    end
+end
+
+local status, stats, nodes = load_state()
+local subscription_present = read_file(subscription_path) ~= ""
+local source_counts = {crunch=0, repository=0}
+for _, node in ipairs(nodes) do
+    if node.source ~= "crunch" or subscription_present then
+        source_counts[node.source] = (source_counts[node.source] or 0) + 1
+    end
+end
+
+local function display_status(key, value)
+    local values = {
+        mode = {off="Выключен", on="Включен", pending="Проверка подключения", ["local"]="Локальная проверка"},
+        active = {none="Не выбран"},
+        engine = {stopped="Остановлен", running="Работает"},
+        routes = {off="Не используется", on="Используется"},
+        watchdog = {stopped="Остановлено", running="Работает"},
+        updating = {no="Нет", yes="Идёт"}
+    }
+    if key == "active" and value and value ~= "none" then
+        for _, node in ipairs(nodes) do
+            if node.id == value then return node.label end
+        end
+    end
+    return (values[key] and values[key][value]) or value or "Неизвестно"
+end
+local wants_json = query.api == "status" or form.api == "1" or (os.getenv("HTTP_ACCEPT") or ""):find("application/json", 1, true)
+
+local function write_json_state()
+    io.write("Content-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n")
+    io.write('{"ok":', action_ok and "true" or "false", ',"message":', json(message), ',"status":{')
+    local first = true
+    for _, key in ipairs({"mode", "active", "engine", "routes", "watchdog", "updating", "ranking", "selected", "autostart", "pending", "youtube_best", "youtube_best_score", "youtube_best_latency", "youtube_testing", "youtube_done", "youtube_total", "youtube_source", "scan_phase", "scan_testing", "scan_done", "scan_total"}) do
+        if not first then io.write(",") end
+        first = false
+        io.write(json(key), ":", json(status[key] or "?"))
+    end
+    io.write('},"stats":{')
+    first = true
+    for _, key in ipairs({"total_vless", "unique_compatible", "reality", "vision", "grpc", "xhttp", "probe_candidates", "scanned", "reachable"}) do
+        if not first then io.write(",") end
+        first = false
+        io.write(json(key), ":", json(stats[key] or "0"))
+    end
+    io.write('},"subscription":{"present":', subscription_present and "true" or "false", '},"paths":[')
+    local path_labels = {lan1="LAN1", lan2="LAN2", lan3="LAN3", lan4="LAN4", wifi="Wi-Fi"}
+    for index, path in ipairs({"lan1", "lan2", "lan3", "lan4", "wifi"}) do
+        if index > 1 then io.write(",") end
+        local value = status["path_" .. path] or "off|unknown|||0"
+        local fields = {}
+        for field in (value .. "|"):gmatch("([^|]*)|") do fields[#fields + 1] = field end
+        io.write('{"id":', json(path), ',"label":', json(path_labels[path]),
+                 ',"selected":', fields[1] == "on" and "true" or "false",
+                 ',"link":', json(fields[2] or "unknown"), ',"speed":', json(fields[3] or ""),
+                 ',"duplex":', json(fields[4] or ""), ',"devices":', json(fields[5] or "0"), "}")
+    end
+    io.write('],"nodes":[')
+    for index, node in ipairs(nodes) do
+        if index > 1 then io.write(",") end
+        io.write('{"latency":', json(node.latency), ',"id":', json(node.id), ',"label":', json(node.label), ',"protocol":', json(node.protocol), ',"server":', json(node.server), ',"port":', json(node.port), ',"transport":', json(node.transport), ',"security":', json(node.security), ',"source":', json(node.source), ',"youtube_score":', json(node.youtube_score), ',"youtube_page":', json(node.youtube_page), ',"youtube_media":', json(node.youtube_media), ',"youtube_latency":', json(node.youtube_score), ',"youtube_best":', node.youtube_best and "true" or "false", "}")
+    end
+    io.write("]}")
+end
+
+if wants_json then
+    write_json_state()
+    os.exit(0)
+end
+
+local subscription_nodes, repository_nodes, youtube_nodes = {}, {}, {}
+for _, node in ipairs(nodes) do
+    if node.source == "crunch" then
+        if subscription_present then subscription_nodes[#subscription_nodes + 1] = node end
+    else
+        repository_nodes[#repository_nodes + 1] = node
+    end
+    if node.youtube_score ~= "" then youtube_nodes[#youtube_nodes + 1] = node end
+end
+table.sort(youtube_nodes, function(left, right)
+    local left_score, right_score = tonumber(left.youtube_score) or 999999, tonumber(right.youtube_score) or 999999
+    if left_score == right_score then return (tonumber(left.latency) or 999999) < (tonumber(right.latency) or 999999) end
+    return left_score < right_score
+end)
+
+local function ping_class(value)
+    value = tonumber(value) or 999999
+    if value <= 120 then return "ping-good", "хороший отклик" end
+    if value <= 300 then return "ping-medium", "средний отклик" end
+    return "ping-slow", "высокий отклик"
+end
+
+local function startup_class(value)
+    value = tonumber(value) or 999999
+    if value <= 1000 then return "ping-good" end
+    if value <= 2000 then return "ping-medium" end
+    return "ping-slow"
+end
+
+local function write_node(node, best_result)
+    local class = "node"
+    if node.id == status.active then class = class .. " active" end
+    if best_result then class = class .. " best-result" end
+    local ping_style, ping_text = ping_class(node.latency)
+    local source_style = node.source == "crunch" and "subscription" or "repository"
+    local source_label = node.source == "crunch" and "Моя подписка" or "Репозиторий"
+    io.write('<article class="', class, '" data-node-id="', html(node.id), '"><div class="node-details"><div class="name">', html(node.label))
+    if node.youtube_best then io.write(' <span class="winner-badge">№1 для YouTube</span>') end
+    io.write('</div><div class="meta"><span class="source-badge ', source_style, '">', source_label, '</span><span>Отклик <span class="ping-badge ', ping_style, '" title="', ping_text, '">', html(node.latency), ' мс</span></span><span>', html(node.protocol:upper()), ' · ', html(node.transport), '/', html(node.security), '</span><span>', html(node.server), ':', html(node.port), '</span>')
+    if node.youtube_score ~= "" then
+        io.write('<span>YouTube: страница <span class="ping-badge ', startup_class(node.youtube_page), '" title="Холодное открытие страницы через новый VPN-туннель">', html(node.youtube_page), ' мс</span></span>')
+        io.write('<span>видеосеть <span class="ping-badge ', startup_class(node.youtube_media), '" title="Холодная проверка доступности Googlevideo через новый VPN-туннель">', html(node.youtube_media), ' мс</span></span>')
+    end
+    io.write('</div></div><div class="actions">')
+    io.write('<form method="post"><input type="hidden" name="token" value="', html(token), '"><input type="hidden" name="id" value="', html(node.id), '"><button name="action" value="enable" data-pending="Подключение…"', node.id == status.active and ' data-connected="yes" disabled' or '', '>', node.id == status.active and 'Подключено' or 'Подключить', '</button></form>')
+    io.write('<form method="post"><input type="hidden" name="token" value="', html(token), '"><input type="hidden" name="id" value="', html(node.id), '"><button class="secondary" name="action" value="youtube" data-pending="Проверка YouTube…">Проверить YouTube</button></form>')
+    io.write('<form method="post"><input type="hidden" name="token" value="', html(token), '"><input type="hidden" name="id" value="', html(node.id), '"><button class="secondary" name="action" value="probe" data-pending="Проверка…">Проверить сеть</button></form></div></article>')
+end
+
+io.write("Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nX-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self' https://www.youtube.com; form-action 'self'; frame-ancestors 'none'\r\n\r\n")
+io.write('<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="n300vpn-token" content="', html(token), '"><title>N300 VPN</title><style>')
+io.write([[:root{--ink:#17221c;--muted:#667069;--paper:#f5f6f2;--surface:#fff;--line:#dce2dc;--primary:#1f3529;--primary-hover:#15281e;--soft:#e9eee9;--danger:#a63737;--subscription:#744066;--subscription-bg:#f6eaf2;--repository:#216b60;--repository-bg:#e7f3ef;--good:#1f6a3a;--good-bg:#e7f5eb;--medium:#7a5500;--medium-bg:#fff2cc;--slow:#9b3029;--slow-bg:#fde9e6}*{box-sizing:border-box}body{font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--paper);color:var(--ink);margin:0;border-top:6px solid #112419}.wrap{max-width:1040px;margin:auto;padding:30px 24px 48px}h1{font-size:30px;letter-spacing:-.025em;margin:0 0 5px}h2{font-size:22px;letter-spacing:-.015em;margin:0}.sub,.section-description{color:var(--muted)}.sub{margin-bottom:18px}.status,.node,.note,.message{background:var(--surface);border:1px solid var(--line);border-radius:13px}.status{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:13px;padding:17px;margin:12px 0}.k{font-size:12px;color:#747d77}.v{font-weight:750;margin-top:3px}.message{padding:14px 16px;margin:12px 0;white-space:pre-wrap;background:#edf6ee}.message.error{background:#faeceb;border-color:#ddb1ad}.message[hidden],button[hidden],section[hidden],form[hidden]{display:none!important}.top-actions{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0 8px}.server-group{margin-top:30px}.section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:12px}.section-description{font-size:13px;margin:4px 0 0}.section-tools{display:flex;align-items:center;gap:8px}.count-badge{font-size:12px;font-weight:700;color:var(--muted);background:var(--soft);border-radius:999px;padding:4px 9px}.nodes{display:grid;gap:10px}.node{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;align-items:center;padding:15px}.node.active{border-color:#46805a;outline:1px solid #46805a}.node.best-result{border-left:4px solid #c58c19}.name{font-weight:750}.meta{display:flex;align-items:center;gap:7px;flex-wrap:wrap;color:var(--muted);font-size:13px;margin-top:7px;overflow-wrap:anywhere}.source-badge,.ping-badge,.winner-badge{display:inline-flex;align-items:center;border-radius:999px;font-weight:750;white-space:nowrap}.source-badge{padding:3px 8px}.source-badge.subscription{color:var(--subscription);background:var(--subscription-bg)}.source-badge.repository{color:var(--repository);background:var(--repository-bg)}.source-badge.best{color:#765005;background:#fff0c4}.ping-badge{padding:2px 7px}.ping-good{color:var(--good);background:var(--good-bg)}.ping-medium{color:var(--medium);background:var(--medium-bg)}.ping-slow{color:var(--slow);background:var(--slow-bg)}.winner-badge{font-size:12px;color:#765005;background:#fff0c4;padding:3px 8px;margin-left:5px}.actions{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}button{border:0;border-radius:9px;min-height:44px;padding:9px 13px;background:var(--primary);color:#fff;font:600 14px/1.2 inherit;cursor:pointer;transition:background-color .15s ease,opacity .15s ease}button:hover{background:var(--primary-hover)}button.secondary{background:var(--soft);color:var(--ink)}button.secondary:hover{background:#dce4dd}button.danger{background:var(--danger)}button.icon-button{min-width:44px;padding:8px;font-size:21px}button:focus-visible,input:focus-visible{outline:3px solid #d29d31;outline-offset:2px}button:disabled{cursor:wait;opacity:.48}.note{padding:14px;margin:12px 0;color:#59625c;font-size:13px}.empty-state{padding:20px;text-align:center}.empty-state button{margin-top:10px}dialog{width:min(570px,calc(100% - 28px));border:1px solid var(--line);border-radius:15px;padding:0;color:inherit;background:#fafbf8}dialog::backdrop{background:rgba(17,31,23,.48)}.dialog-body{padding:22px}.dialog-title{font-size:22px;font-weight:780;margin:0 0 5px}.path-list,.source-list{display:grid;gap:9px;margin:17px 0}.source-list button{width:100%;text-align:left}.path-row{display:grid;grid-template-columns:auto 1fr auto;gap:11px;align-items:center;background:#fff;border:1px solid var(--line);border-radius:10px;padding:11px}.path-row input{width:20px;height:20px}.path-state{color:var(--muted);font-size:13px;text-align:right}.form-label{display:block;font-weight:700;margin:17px 0 7px}.url-input{width:100%;min-height:46px;border:1px solid #bfc9c1;border-radius:9px;background:#fff;color:var(--ink);font:16px inherit;padding:10px 12px}.dialog-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-top:18px}.danger-note{color:#7c2929;background:#faeceb;border:1px solid #e4b8b4;border-radius:10px;padding:12px;margin-top:14px}@media(max-width:680px){.wrap{padding:20px 14px 38px}.node{grid-template-columns:1fr}.actions{justify-content:flex-start}.section-head{align-items:center}.path-state{grid-column:2/4;text-align:left}}@media(prefers-reduced-motion:reduce){button{transition:none}}
+]])
+io.write('</style><script defer src="/app.js?v=20260824-safeconnect2"></script></head><body><main class="wrap" id="app"><h1>N300 VPN</h1><div class="sub">VPN для SmartBox N300 · проект работает с USB-накопителя</div>')
+io.write('<div class="message', action_ok and '' or ' error', '" id="message" role="status" aria-live="polite"', message == "" and ' hidden' or '', '>', html(message), '</div>')
+io.write('<section class="status" id="status">')
+local labels = {mode="VPN",active="Выбранный сервер",engine="VPN-процесс",routes="Трафик через VPN",watchdog="Автовосстановление",updating="Обновление списка",selected="Доступных серверов",autostart="После перезагрузки"}
+for _, key in ipairs({"mode","active","engine","routes","watchdog","updating","selected","autostart"}) do
+    io.write('<div><div class="k">', labels[key], '</div><div class="v" id="status-', key, '">', html(display_status(key, status[key])), '</div></div>')
+end
+io.write('</section><div class="top-actions">')
+io.write('<form method="post"><input type="hidden" name="token" value="', html(token), '"><button class="secondary" id="refresh-button" name="action" value="refresh" data-pending="Запускаю обновление…">Обновить списки</button></form>')
+io.write('<button type="button" id="rank-button" data-action="rank-youtube">Выбрать лучший для YouTube</button>')
+io.write('<button type="button" class="secondary" id="open-add-subscription" data-action="add-subscription">', subscription_present and 'Заменить подписку' or 'Добавить подписку', '</button>')
+io.write('<button type="button" class="secondary" id="open-settings">Настройка VPN</button>')
+io.write('<form method="post" id="disable-vpn-form"', (status.mode == "on" or status.mode == "local") and '' or ' hidden', '><input type="hidden" name="token" value="', html(token), '"><button class="danger" name="action" value="disable" data-pending="Отключение…">Выключить VPN</button></form></div>')
+
+io.write('<dialog id="source-dialog"><div class="dialog-body"><div class="dialog-title">Откуда проверять серверы?</div><div class="sub">Роутер проверит только выбранный список и сохранит все успешные результаты в разделе «Лучшие серверы».</div><div class="source-list">')
+io.write('<form method="post"><input type="hidden" name="token" value="', html(token), '"><input type="hidden" name="source" value="crunch"><button id="rank-subscription" name="action" value="rank-youtube" data-pending="Запускаю проверку…" data-unavailable="', source_counts.crunch == 0 and 'yes' or 'no', '"', source_counts.crunch == 0 and ' disabled' or '', '>Моя подписка · ', html(source_counts.crunch), ' доступных</button></form>')
+io.write('<form method="post"><input type="hidden" name="token" value="', html(token), '"><input type="hidden" name="source" value="repository"><button id="rank-repository" name="action" value="rank-youtube" data-pending="Запускаю проверку…" data-unavailable="', source_counts.repository == 0 and 'yes' or 'no', '"', source_counts.repository == 0 and ' disabled' or '', '>Репозиторий igareck · ', html(source_counts.repository), ' доступных</button></form>')
+io.write('</div><div class="dialog-actions"><button type="button" class="secondary" data-close-dialog="source-dialog">Отмена</button></div></div></dialog>')
+
+io.write('<dialog id="add-subscription-dialog"><form method="post" id="subscription-form"><input type="hidden" name="token" value="', html(token), '"><input type="hidden" name="action" value="add-subscription"><div class="dialog-body"><div class="dialog-title">', subscription_present and 'Заменить подписку' or 'Добавить подписку', '</div><div class="sub">Вставьте ссылку подписки Crunch из Happ или V2RayTun. Ссылка хранится только на USB и не показывается на странице.</div><label class="form-label" for="subscription-url">Ссылка подписки</label><input class="url-input" id="subscription-url" name="url" type="url" required autocomplete="off" spellcheck="false" placeholder="https://crunch-crunch.com/sub/…"><div class="dialog-actions"><button type="button" class="secondary" data-close-dialog="add-subscription-dialog">Отмена</button><button type="submit" data-pending="Сохраняю…">Сохранить и обновить</button></div></div></form></dialog>')
+
+io.write('<dialog id="subscription-actions-dialog"><div class="dialog-body"><div class="dialog-title">Моя подписка</div><div class="sub">Здесь можно заменить ссылку или удалить её вместе с сохранённым списком серверов.</div><div class="danger-note">Удаление доступно только когда VPN выключен. После удаления роутер автоматически обновит серверы репозитория.</div><div class="dialog-actions"><button type="button" class="secondary" data-close-dialog="subscription-actions-dialog">Отмена</button><button type="button" class="secondary" id="replace-subscription">Заменить ссылку</button><form method="post"><input type="hidden" name="token" value="', html(token), '"><button class="danger" name="action" value="delete-subscription" data-pending="Удаляю…">Удалить подписку</button></form></div></div></dialog>')
+
+io.write('<dialog id="path-dialog"><form method="post" id="path-form"><input type="hidden" name="token" value="', html(token), '"><input type="hidden" name="action" value="set-paths"><div class="dialog-body"><div class="dialog-title">Настройка VPN</div><div class="sub">Отмеченные подключения используют VPN. Остальные выходят напрямую через основной роутер.</div><div class="path-list">')
+local path_labels = {lan1="LAN1", lan2="LAN2", lan3="LAN3", lan4="LAN4", wifi="Wi-Fi"}
+for _, path in ipairs({"lan1", "lan2", "lan3", "lan4", "wifi"}) do
+    local value = status["path_" .. path] or "off|unknown|||0"
+    local selected = value:match("^on|") ~= nil
+    io.write('<label class="path-row"><input type="checkbox" name="path_', path, '" value="1"', selected and ' checked' or '', '><span><strong>', path_labels[path], '</strong></span><span class="path-state" data-path-state="', path, '">Проверяю…</span></label>')
+end
+io.write('</div><div class="note">WAN аппаратно исключён и не может быть выбран. Изменение применяется к новым соединениям; активные загрузки могут завершиться по прежнему пути.</div><div class="dialog-actions"><button type="button" class="secondary" data-close-dialog="path-dialog">Отмена</button><button type="submit" data-pending="Применение…">Сохранить</button></div></div></form></dialog>')
+
+io.write('<section class="server-group" id="best-section"', #youtube_nodes == 0 and ' hidden' or '', '><div class="section-head"><div><div><span class="source-badge best">Проверено YouTube</span></div><h2>Лучшие серверы</h2><p class="section-description">Сначала идут серверы, у которых быстрее худшая из двух независимых проверок: страницы YouTube и видеосети Googlevideo.</p></div><span class="count-badge" id="best-count">', html(#youtube_nodes), '</span></div><div class="nodes" id="best-nodes">')
+for _, node in ipairs(youtube_nodes) do write_node(node, true) end
+io.write('</div></section>')
+
+io.write('<section class="server-group" id="subscription-section" data-subscription-present="', subscription_present and 'yes' or 'no', '"><div class="section-head" id="subscription-header" tabindex="0"><div><div><span class="source-badge subscription">Моя подписка</span></div><h2>Моя подписка</h2><p class="section-description" id="subscription-description">', subscription_present and 'Серверы из добавленной вами ссылки. Нажмите правой кнопкой для управления.' or 'Добавьте свою ссылку, чтобы серверы появились здесь.', '</p></div><div class="section-tools"><span class="count-badge" id="subscription-count">', html(#subscription_nodes), '</span><button type="button" class="secondary icon-button" id="subscription-menu" aria-label="Управление подпиской"', subscription_present and '' or ' hidden', '>⋯</button></div></div><div class="nodes" id="subscription-nodes">')
+for _, node in ipairs(subscription_nodes) do write_node(node, false) end
+if #subscription_nodes == 0 then io.write('<div class="note empty-state">Подписка не добавлена или пока нет ответивших серверов.<br><button type="button" class="secondary" data-open-subscription>Добавить подписку</button></div>') end
+io.write('</div></section>')
+
+io.write('<section class="server-group" id="repository-section"><div class="section-head"><div><div><span class="source-badge repository">Репозиторий</span></div><h2>Доступные серверы</h2><p class="section-description">Проверенные серверы из репозитория igareck.</p></div><span class="count-badge" id="repository-count">', html(#repository_nodes), '</span></div><div class="nodes" id="repository-nodes">')
+for _, node in ipairs(repository_nodes) do write_node(node, false) end
+if #repository_nodes == 0 then io.write('<div class="note empty-state">Серверы репозитория ещё не загружены. Нажмите «Обновить списки».</div>') end
+io.write('</div></section>')
+
+io.write('<div class="note" id="import-note">Найдено серверов VLESS: ', html(stats.total_vless or "0"), '; подходят этому роутеру: ', html(stats.unique_compatible or "0"), '; быстро ответили: ', html(stats.reachable or status.selected or "0"), '; Reality: ', html(stats.reality or "0"), '; Vision: ', html(stats.vision or "0"), '; gRPC: ', html(stats.grpc or "0"), '.</div>')
+io.write([[<div class="note">«Отклик» — обычное время соединения с VPN-сервером, его можно сравнивать с TCP Ping в Happ. Значения «страница» и «видеосеть» — две отдельные холодные проверки с новым защищённым соединением; они не складываются и не являются пингом. Проверка идёт последовательно, чтобы не перегружать роутер, и не включает VPN для ваших устройств.</div></main></body></html>]])
