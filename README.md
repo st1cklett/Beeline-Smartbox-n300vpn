@@ -44,6 +44,11 @@ chmod 700 /mnt/usb/n300vpn/install.sh
 
 5. Откройте в браузере `http://192.168.2.1:8080/cgi-bin/n300vpn`.
 
+<img width="1920" height="1038" alt="image" src="https://github.com/user-attachments/assets/c0437142-e0a3-46bf-baa4-c36f976043b2" />
+
+<img width="1920" height="1001" alt="image" src="https://github.com/user-attachments/assets/fb5ff34c-41af-4bdd-9caf-1e8ec3d487dc" />
+
+
 Если видите `ERR_CONNECTION_REFUSED`, выполните по SSH:
 
 ```sh
@@ -85,3 +90,6 @@ killall n300vless 2>/dev/null || true
 Обновляйте списки кнопкой в панели: старый рабочий список сохраняется при ошибке источника. Исходник `src/n300vless.c` и `Makefile` включены для сборки Lexra/RSDK; обычный x86 или MIPS-бинарник не подходит.
 
 Аппаратные сведения сверены по [4PDA](https://4pda.to/forum/index.php?showtopic=794426&st=3560) и [DeviWiki](https://deviwiki.com/wiki/Beeline_SmartBox). Внешние компоненты сохраняют лицензии своих авторов; проект не является официальным ПО Beeline.
+
+
+
