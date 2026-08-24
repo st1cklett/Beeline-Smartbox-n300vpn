@@ -44,9 +44,9 @@ chmod 700 /mnt/usb/n300vpn/install.sh
 
 5. Откройте в браузере `http://192.168.2.1:8080/cgi-bin/n300vpn`.
 
-<img width="1920" height="1038" alt="image" src="https://github.com/user-attachments/assets/c0437142-e0a3-46bf-baa4-c36f976043b2" />
+<img width="1161" height="911" alt="image" src="https://github.com/user-attachments/assets/3adec012-da43-4153-a6f5-23e8a5cbc745" />
 
-<img width="1920" height="1001" alt="image" src="https://github.com/user-attachments/assets/fb5ff34c-41af-4bdd-9caf-1e8ec3d487dc" />
+<img width="1245" height="741" alt="image" src="https://github.com/user-attachments/assets/fc5e768d-e244-4272-8568-eb85c58cc632" />
 
 
 Если видите `ERR_CONNECTION_REFUSED`, выполните по SSH:
