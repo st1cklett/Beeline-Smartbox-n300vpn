@@ -48,6 +48,9 @@ chmod 700 /mnt/usb/n300vpn/install.sh
 
 <img width="1245" height="741" alt="image" src="https://github.com/user-attachments/assets/fc5e768d-e244-4272-8568-eb85c58cc632" />
 
+<img width="1189" height="920" alt="image" src="https://github.com/user-attachments/assets/f747cc0b-1670-4eab-8751-5aed33acbdc8" />
+
+
 
 Если видите `ERR_CONNECTION_REFUSED`, выполните по SSH:
 
