@@ -1,4 +1,4 @@
-# N300 VPN — VPN на Beeline SmartBox N300
+# N300 VPN — VPN на Beeline SmartBox N300 (beta 0.1)
 
 ![Beeline SmartBox N300](assets/router.png)
 
